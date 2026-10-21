@@ -1,17 +1,14 @@
 #!/usr/bin/env python3
 """
-Skeleton Optimization Agent - Template for students to implement optimization algorithms
+Warehouse optimization agent combining demand-based staffing,
+frequency-based layout optimization, and greedy worker-to-order matching.
 
-IMPORTANT: This is NOT an RL agent - it's a template for 
-students to implement their own optimization algorithms (greedy, Hungarian, etc.)
+Staffing balances pending demand, worker utilization, and profit.
+Layout swaps favor frequently retrieved products near delivery bays.
+Order assignment balances pickup proximity and order value.
 
-This agent currently makes terrible decisions:
-- Random staffing decisions
-- No layout optimization 
-- Ignores order priorities
-- No intelligent assignment logic
-
-Students should replace the naive methods with proper optimization algorithms.
+This agent uses optimization heuristics, not reinforcement learning.
+ 
 """
 
 import numpy as np
@@ -22,13 +19,9 @@ from environment.warehouse_grid import CellType
 
 class SkeletonOptimizationAgent(BaselineAgent):
     """
-    Template for students to implement their own optimization algorithms.
-    
-    Students should replace the naive methods with:
-    - Economic models for staffing decisions
-    - Hungarian algorithm for order assignment  
-    - Greedy search for layout optimization
-    - Multi-objective optimization techniques
+    Coordinate staffing, product placement, and order pickup.
+    Use demand, utilization, and distance estimates to support
+    profitable operation while protecting managers and busy workers.
     """
     
     def __init__(self, env):
@@ -60,21 +53,30 @@ class SkeletonOptimizationAgent(BaselineAgent):
         # TODO: Reset any neural network states, replay buffers, etc.
     
     def get_action(self, observation: Dict) -> Dict:
-        """
-        Generate action based on observation.
-        Current implementation is intentionally terrible - students should improve!
-        """
+        """Coordinate staffing, layout, and worker assignments."""
         
-        # Extract basic info from observation
         current_timestep = observation['time'][0]
-        financial_state = observation['financial']  # [profit, revenue, costs, burn_rate]
+        financial_state = observation['financial']
         queue_info = observation['order_queue']
         employee_info = observation['employees']
+
+        staffing_action = self._get_naive_staffing_action(
+            financial_state, employee_info
+        )
+
+        # Firing changes employee indices before assignments execute.
+        # Allow automatic assignment for this step to avoid stale indices.
+        if staffing_action == 2:
+            assignments = [0] * 20
+        else:
+            assignments = self._get_naive_order_assignments(
+                queue_info, employee_info
+            )
         
         action = {
-            'staffing_action': self._get_naive_staffing_action(financial_state, employee_info),
+            'staffing_action': staffing_action,
             'layout_swap': self._get_naive_layout_action(current_timestep),
-            'order_assignments': self._get_naive_order_assignments(queue_info, employee_info)
+            'order_assignments': assignments
         }
         
         # TODO: Students should implement proper action recording for optimization
@@ -84,65 +86,95 @@ class SkeletonOptimizationAgent(BaselineAgent):
     
     def _get_naive_staffing_action(self, financial_state, employee_info) -> int:
         """
-        Keep one manager available for layout work.
-        Retain random worker staffing within the employee limit.
+        Adjust staffing using demand, utilization, and profit.
+        Preserve at least two workers and protect the manager.
+        Review staffing every 5 steps to respond to changing demand.
         """
         
         # TODO WEEK 2 STEP 1: Students should implement intelligent staffing logic
         # Current approach: Make random decisions based on "vibes"
         
         employees = self.env.employees
-        num_employees = len(employees)
-        has_manager = any(employee.is_manager for employee in employees)
-        can_hire = num_employees < self.env.max_employees
+        workers = [employee for employee in employees
+                   if not employee.is_manager]
+        idle_workers = [worker for worker in workers
+                        if worker.state == EmployeeState.IDLE]
 
-        # Identify who the environment would remove if we request firing.
-        idle_employees = [
-            employee for employee in employees
-            if employee.state == EmployeeState.IDLE
+        has_manager = any(employee.is_manager for employee in employees)
+        can_hire = len(employees) < self.env.max_employees
+        current_profit = float(financial_state[0])
+
+        # Count orders that still need a worker.
+        pending_orders = [
+            order for order in self.env.order_queue.orders
+            if order.status == "pending"
         ]
-        fire_candidate = (
-            idle_employees[0]
-            if idle_employees
-            else (employees[-1] if employees else None)
+        queue_length = len(pending_orders)
+        worker_count = len(workers)
+
+        # The simulator fires the FIRST idle employee.
+        # Only request firing when that person is a safe candidate.
+        fire_candidate = next(
+            (employee for employee in employees
+             if employee.state == EmployeeState.IDLE),
+            None
+        )
+        safe_to_fire = (
+            fire_candidate is not None
+            and not fire_candidate.is_manager
+            and fire_candidate.current_order_id is None
+            and worker_count > 2
         )
 
-        # Prioritize obtaining a manager so layout changes can be performed.
-        if not has_manager:
-            if can_hire:
-                return 3  # Hire one manager
+        # Maintain a minimum workforce so the warehouse can earn revenue.
+        if worker_count < 2 and can_hire:
+            return 1
 
-            # Make room without interrupting an active worker's order.
-            if (
-                fire_candidate is not None
-                and not fire_candidate.is_manager
-                and fire_candidate.state == EmployeeState.IDLE
-            ):
-                return 2
-
+        #  Review staffing every 5 steps to respond to changing demand.
+        if len(self.action_history) % 5 != 0:
             return 0
 
-        # Retain the template's random worker hiring.
-        if np.random.random() < 0.3:
+        # Hire a manager without waiting for positive profit.
+        if not has_manager:
             if can_hire:
-                return 1
+                return 3
+            if safe_to_fire:
+                return 2  # Make room; hire the manager on a later review.
 
-        elif np.random.random() < 0.1:
-            # Never fire the manager or interrupt an active employee.
-            if (
-                num_employees > 1
-                and fire_candidate is not None
-                and not fire_candidate.is_manager
-                and fire_candidate.state == EmployeeState.IDLE
-            ):
-                return 2
+        queue_pressure = queue_length / max(1, worker_count)
+        utilization = (
+            (worker_count - len(idle_workers)) / max(1, worker_count)
+        )
 
-        return 0 
+        # Hire when demand is high, workers are busy, and profit is positive.
+        if (
+            can_hire
+            and queue_pressure > 3.0
+            and utilization >= 0.80
+            and current_profit > 0
+        ):
+            return 1
+
+        # Reduce wage costs only when there is spare capacity.
+        severe_overstaffing = (
+            queue_length == 0
+            and len(idle_workers) > worker_count / 2
+        )
+        if (
+            safe_to_fire
+            and queue_pressure < 1.5
+            and utilization < 0.50
+            and (current_profit < 0 or severe_overstaffing)
+        ):
+            return 2
+
+        return 0
     
     def _get_naive_layout_action(self, current_timestep) -> list:
         """
-        Retain the template's random staffing decisions while correcting
-        employee counting, manager detection, and hiring limits.
+        Every 100 steps, select a beneficial accessible storage swap.
+        Score retrieval frequency per product copy, delivery distance,
+        and manager travel. Require an idle manager.
         """
         
         # TODO WEEK 1 STEP 1: Students should implement intelligent layout optimization
@@ -280,29 +312,104 @@ class SkeletonOptimizationAgent(BaselineAgent):
     
     def _get_naive_order_assignments(self, queue_info, employee_info) -> list:
         """
-        WEEK 2 STEP 2: Order assignment - students should improve this!
-        
-        Current problems:
-        - Ignores employee locations
-        - No consideration of order priority/value
-        - Random assignments regardless of efficiency
-        - Doesn't check if employees are actually available
+        Greedily match idle workers to pending orders
+
+        Score proximity to the nearest required item and order value
+        Each worker and order can be selected only once per step
         """
         
         # TODO WEEK 2 STEP 2: Students should implement intelligent order assignment
-        # Current approach: Random assignments
+        # Match idle workers using pickup proximity and order value
         
         assignments = [0] * 20  # No assignments by default
         
-        # Count how many employees we have (very naive)
-        num_employees = int(np.sum(employee_info[:, 0] > 0))
-        
-        # Randomly assign first few orders to first few employees
-        if num_employees > 0:
-            for i in range(min(3, num_employees)):  # Only assign 3 orders max
-                if np.random.random() < 0.6:  # 60% chance to assign
-                    assignments[i] = (i % num_employees) + 1  # Random employee
-        
+        grid = self.env.warehouse_grid
+
+        idle_workers = [
+            (index, employee)
+            for index, employee in enumerate(self.env.employees)
+            if (
+                not employee.is_manager
+                and employee.state == EmployeeState.IDLE
+                and employee.current_order_id is None
+            )
+        ]
+
+        # Preserve queue indices: each action slot refers to that position.
+        pending_orders = [
+            (index, order)
+            for index, order in enumerate(
+                self.env.order_queue.orders[:len(assignments)]
+            )
+            if order.status == "pending"
+        ]
+
+        if not idle_workers or not pending_orders:
+            return assignments
+
+        max_value = max(
+            1.0,
+            max(order.value for _, order in pending_orders)
+        )
+
+        # Look up each product once during this decision.
+        required_items = {
+            item
+            for _, order in pending_orders
+            for item in order.items
+        }
+        item_locations = {
+            item: [
+                position
+                for position in grid.find_item_locations(item)
+                if grid.can_access_storage(*position)
+            ]
+            for item in required_items
+        }
+
+        scored_pairs = []
+
+        for order_index, order in pending_orders:
+            # A relocation can temporarily make a product unavailable.
+            if not order.items or any(
+                not item_locations[item] for item in order.items
+            ):
+                continue
+
+            for worker_index, worker in idle_workers:
+                distance = min(
+                    abs(worker.position[0] - position[0])
+                    + abs(worker.position[1] - position[1])
+                    for item in order.items
+                    for position in item_locations[item]
+                )
+
+                distance_score = 1.0 / (1.0 + distance)
+                value_score = order.value / max_value
+                score = 0.70 * distance_score + 0.30 * value_score
+
+                scored_pairs.append(
+                    (score, order_index, worker_index)
+                )
+
+        # Prefer higher scores; use indices to break ties consistently.
+        scored_pairs.sort(key=lambda pair: (-pair[0], pair[1], pair[2]))
+
+        assigned_workers = set()
+        assigned_orders = set()
+
+        for score, order_index, worker_index in scored_pairs:
+            if (
+                worker_index in assigned_workers
+                or order_index in assigned_orders
+            ):
+                continue
+
+            # The simulator uses 1-based employee indices; zero means none.
+            assignments[order_index] = worker_index + 1
+            assigned_workers.add(worker_index)
+            assigned_orders.add(order_index)
+
         return assignments
     
     def record_reward(self, reward: float):
